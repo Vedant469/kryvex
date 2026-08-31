@@ -1,0 +1,19 @@
+[project]
+name = "kryvex"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Vedant469", email = "vedantnvidia4@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=2.1.1",
+]
+
+[project.scripts]
+kryvex = "kryvex:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
