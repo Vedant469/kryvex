@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""
-Face ID + Blockchain Verification Pipeline
-
-Detects a face, reverse-searches it via SerpApi Google Lens,
-and records the match on Polygon Amoy testnet.
-"""
 
 from __future__ import annotations
 
@@ -12,155 +5,141 @@ import argparse
 import hashlib
 import json
 import os
-import secrets
 import sys
 import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import cv2
 import face_recognition
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from PIL import Image
-from serpapi import GoogleSearch
+from PIL import Image, UnidentifiedImageError
 from solcx import compile_standard, install_solc, set_solc_version
 from web3 import Web3
-from web3.middleware import ExtraDataToPOAMiddleware
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
-SOCIAL_MEDIA_DOMAINS: tuple[str, ...] = (
-    "facebook.com",
-    "fb.com",
-    "instagram.com",
-    "twitter.com",
-    "x.com",
-    "linkedin.com",
-    "tiktok.com",
-    "pinterest.com",
-    "reddit.com",
-    "threads.net",
-    "snapchat.com",
-    "youtube.com",
-)
+APP_TITLE = "Face ID + Blockchain Verification Pipeline"
+SOLIDITY_VERSION = "0.8.20"
+FACE_DISTANCE_THRESHOLD = 0.55
+DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024
+LIVENESS_TIMEOUT_SECONDS = 30
+REQUIRED_ENV = ("SERPAPI_KEY", "POLYGON_RPC_URL", "WALLET_PRIVATE_KEY")
 
-SERPAPI_IMAGE_MAX_BYTES = 500 * 1024  # 500 KB SerpApi upload limit
-AMOY_CHAIN_ID = 80002
-POLYGONSCAN_TX_URL = "https://amoy.polygonscan.com/tx/{tx_hash}"
-SOLC_VERSION = "0.8.20"
 CONTRACT_SOURCE = Path(__file__).resolve().parent / "VerificationLog.sol"
 
-# Face match: lower = stricter. 0.6 is face_recognition's default "same person" cutoff.
-FACE_DISTANCE_THRESHOLD = 0.55
-EAR_BLINK_THRESHOLD = 0.21
-BLINK_CONSEC_FRAMES = 2
-BLINKS_REQUIRED = 2
-LIVENESS_TIMEOUT_SEC = 30
-MIN_FACE_SHARPNESS = 40.0
-DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024
+SOCIAL_DOMAINS = (
+    "instagram.com",
+    "facebook.com",
+    "tiktok.com",
+    "x.com",
+    "twitter.com",
+    "reddit.com",
+    "linkedin.com",
+    "threads.net",
+    "youtube.com",
+    "pinterest.com",
+    "snapchat.com",
+)
 
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
 
-
-def log(step: str, message: str) -> None:
-    print(f"[{step}] {message}")
+def log(stage: str, message: str) -> None:
+    print(f"[{stage}] {message}")
 
 
 def log_success(message: str) -> None:
     print(f"  ✓ {message}")
 
 
-def log_error(message: str) -> None:
-    print(f"  ✗ {message}", file=sys.stderr)
-
-
 def exit_with_error(message: str, code: int = 1) -> None:
-    log_error(message)
-    sys.exit(code)
-
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
+    print(f"  ✗ {message}", file=sys.stderr)
+    raise SystemExit(code)
 
 
 def load_config() -> dict[str, str]:
     load_dotenv()
 
-    required = ("SERPAPI_KEY", "POLYGON_RPC_URL", "WALLET_PRIVATE_KEY")
-    config: dict[str, str] = {}
-    missing: list[str] = []
-
-    for key in required:
-        value = os.getenv(key, "").strip()
-        if not value:
-            missing.append(key)
-        else:
-            config[key] = value
-
+    missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
     if missing:
         exit_with_error(
             "Missing required environment variables: "
             + ", ".join(missing)
-            + ". Copy .env.example to .env and fill in your keys."
+            + ". Copy .env.example to .env and fill in the values."
         )
 
+    config = {name: os.getenv(name, "").strip() for name in REQUIRED_ENV}
     config["CONTRACT_ADDRESS"] = os.getenv("CONTRACT_ADDRESS", "").strip()
     return config
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Face detection & encoding
+# Face processing
 # ---------------------------------------------------------------------------
 
+def load_image_rgb(image_path: str) -> np.ndarray:
+    path = Path(image_path)
+    if not path.is_file():
+        exit_with_error(f"Input image not found: {path}")
 
-def load_image_rgb(image_path: Path) -> np.ndarray:
-    if not image_path.is_file():
-        exit_with_error(f"Image not found: {image_path}")
+    try:
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            return np.asarray(image)
+    except (UnidentifiedImageError, OSError) as exc:
+        exit_with_error(f"Could not decode input image: {exc}")
 
-    image_bgr = cv2.imread(str(image_path))
-    if image_bgr is None:
-        exit_with_error(f"Unable to read image (unsupported or corrupt): {image_path}")
 
-    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+def _detect_faces_static(image_rgb: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Detect faces in static images using fast HOG with CNN fallback."""
+    locations = face_recognition.face_locations(
+        image_rgb,
+        model="hog",
+        number_of_times_to_upsample=1,
+    )
+
+    if locations:
+        return locations
+
+    log("FACE", "HOG detector found no face; trying CNN fallback…")
+    locations = face_recognition.face_locations(
+        image_rgb,
+        model="cnn",
+        number_of_times_to_upsample=1,
+    )
+
+    if locations:
+        log_success(f"CNN fallback detected {len(locations)} face(s).")
+
+    return locations
+
+
+def encode_largest_face(image_rgb: np.ndarray) -> tuple[np.ndarray, int]:
+    locations = _detect_faces_static(image_rgb)
+    if not locations:
+        exit_with_error(
+            "No face detected in the image. Use a clear photo with a visible face."
+        )
+
+    if len(locations) > 1:
+        exit_with_error(
+            f"Found {len(locations)} faces in the image. "
+            "Use a photo with exactly one visible face."
+        )
+
+    encodings = face_recognition.face_encodings(
+        image_rgb, known_face_locations=locations
+    )
+    if not encodings:
+        exit_with_error("Face was detected but could not be encoded.")
+
+    return encodings[0], 0
 
 
 def detect_and_hash_face(image_rgb: np.ndarray) -> tuple[np.ndarray, str]:
     log("FACE", "Detecting faces in image…")
-    face_locations = face_recognition.face_locations(image_rgb, model="hog")
-
-    if not face_locations:
-        exit_with_error(
-            "No face detected in the image. "
-            "Use a clear, front-facing photo with a single visible face."
-        )
-
-    if len(face_locations) > 1:
-        exit_with_error(
-            f"Found {len(face_locations)} faces in the image. "
-            "Use a photo with exactly one face (rejects 'hold a photo next to me')."
-        )
-
-    # Pick the face with the largest bounding box
-    def area(loc: tuple[int, int, int, int]) -> int:
-        top, right, bottom, left = loc
-        return (bottom - top) * (right - left)
-
-    best_location = max(face_locations, key=area)
-    encodings = face_recognition.face_encodings(image_rgb, known_face_locations=[best_location])
-
-    if not encodings:
-        exit_with_error("Face was detected but encoding failed. Try a higher-quality image.")
-
-    encoding = encodings[0]
+    encoding, _ = encode_largest_face(image_rgb)
     face_hash = hash_encoding(encoding)
     log_success(f"Face encoded — SHA-256 hash: {face_hash}")
     return encoding, face_hash
@@ -170,100 +149,203 @@ def hash_encoding(encoding: np.ndarray) -> str:
     return hashlib.sha256(encoding.tobytes()).hexdigest()
 
 
-def encode_largest_face(image_rgb: np.ndarray) -> tuple[np.ndarray, int]:
-    """Return (encoding, face_count). encoding is None-equivalent via empty if none."""
-    locations = face_recognition.face_locations(image_rgb, model="hog")
-    if not locations:
-        return np.array([]), 0
-
-    def area(loc: tuple[int, int, int, int]) -> int:
-        top, right, bottom, left = loc
-        return (bottom - top) * (right - left)
-
-    best = max(locations, key=area)
-    encodings = face_recognition.face_encodings(image_rgb, known_face_locations=[best])
-    if not encodings:
-        return np.array([]), len(locations)
-    return encodings[0], len(locations)
+def face_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return float(face_recognition.face_distance([a], b)[0])
 
 
 def encodings_match(a: np.ndarray, b: np.ndarray, label: str) -> float:
-    if a.size == 0 or b.size == 0:
-        exit_with_error(f"Cannot compare faces ({label}): missing encoding.")
-    distance = float(face_recognition.face_distance([a], b)[0])
-    same = distance <= FACE_DISTANCE_THRESHOLD
-    log("MATCH", f"{label}: distance={distance:.4f} (threshold {FACE_DISTANCE_THRESHOLD})")
-    if not same:
-        exit_with_error(
-            f"Face mismatch ({label}). Distance {distance:.4f} > {FACE_DISTANCE_THRESHOLD}. "
-            "The live person does not match the photo being verified."
-        )
-    log_success(f"{label}: same person")
+    distance = face_distance(a, b)
+    log(
+        "MATCH",
+        f"{label}: distance={distance:.4f} "
+        f"(threshold {FACE_DISTANCE_THRESHOLD:.2f})",
+    )
     return distance
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — SerpApi reverse image search (Google Lens)
+# Liveness / anti-spoofing
 # ---------------------------------------------------------------------------
 
+def _eye_aspect_ratio(eye: list[tuple[int, int]]) -> float:
+    if len(eye) < 6:
+        return 1.0
 
-def prepare_image_for_upload(image_path: Path) -> tuple[bytes, str]:
-    """Resize/compress image to stay within SerpApi's 500 KB upload limit."""
-    with Image.open(image_path) as img:
-        img = img.convert("RGB")
-        quality = 90
-        max_dim = 2048
+    p = np.asarray(eye, dtype=np.float32)
+    vertical_1 = np.linalg.norm(p[1] - p[5])
+    vertical_2 = np.linalg.norm(p[2] - p[4])
+    horizontal = np.linalg.norm(p[0] - p[3])
 
-        while True:
-            working = img.copy()
-            w, h = working.size
-            if max(w, h) > max_dim:
-                scale = max_dim / max(w, h)
-                working = working.resize(
-                    (int(w * scale), int(h * scale)), Image.Resampling.LANCZOS
-                )
+    if horizontal <= 1e-6:
+        return 1.0
 
-            buffer = BytesIO()
-            working.save(buffer, format="JPEG", quality=quality, optimize=True)
-            data = buffer.getvalue()
-
-            if len(data) <= SERPAPI_IMAGE_MAX_BYTES:
-                return data, "image/jpeg"
-
-            if quality > 40:
-                quality -= 10
-            elif max_dim > 512:
-                max_dim = int(max_dim * 0.75)
-            else:
-                exit_with_error(
-                    f"Unable to compress image below {SERPAPI_IMAGE_MAX_BYTES} bytes "
-                    "for SerpApi upload."
-                )
+    return float((vertical_1 + vertical_2) / (2.0 * horizontal))
 
 
-def upload_image_to_serpapi(image_path: Path, api_key: str) -> str:
-    log("SERPAPI", "Uploading image to SerpApi Image API…")
-    image_bytes, mime_type = prepare_image_for_upload(image_path)
+def _frame_sharpness(frame: np.ndarray) -> float:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    response = requests.post(
-        "https://serpapi.com/image",
-        params={"api_key": api_key},
-        files={"image": ("upload.jpg", image_bytes, mime_type)},
-        timeout=60,
+
+def run_liveness_challenge(camera_index: int) -> tuple[np.ndarray, str]:
+    log(
+        "LIVENESS",
+        "Starting webcam challenge — blink twice within "
+        f"{LIVENESS_TIMEOUT_SECONDS} seconds.",
     )
 
-    if response.status_code != 200:
+    capture = cv2.VideoCapture(camera_index)
+    if not capture.isOpened():
         exit_with_error(
-            f"SerpApi image upload failed ({response.status_code}): {response.text}"
+            f"Could not open webcam device {camera_index}. "
+            "Check camera permissions or try --camera 1."
         )
 
-    payload = response.json()
+    nonce = hashlib.sha256(
+        f"{time.time_ns()}:{os.urandom(16).hex()}".encode()
+    ).hexdigest()[:32]
+
+    deadline = time.monotonic() + LIVENESS_TIMEOUT_SECONDS
+    blink_count = 0
+    eye_closed = False
+    last_encoding: np.ndarray | None = None
+    sharp_frames = 0
+
+    try:
+        while time.monotonic() < deadline:
+            ok, frame = capture.read()
+            if not ok:
+                continue
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(rgb, model="hog")
+
+            if len(locations) != 1:
+                cv2.putText(
+                    frame,
+                    "Show exactly one face",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+                cv2.imshow("Kryvex Liveness — press Q to cancel", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    exit_with_error("Liveness challenge cancelled.")
+                continue
+
+            landmarks = face_recognition.face_landmarks(
+                rgb, face_locations=locations
+            )
+            if not landmarks:
+                continue
+
+            landmark = landmarks[0]
+            left_eye = landmark.get("left_eye", [])
+            right_eye = landmark.get("right_eye", [])
+
+            left_ear = _eye_aspect_ratio(left_eye)
+            right_ear = _eye_aspect_ratio(right_eye)
+            ear = (left_ear + right_ear) / 2.0
+
+            sharpness = _frame_sharpness(frame)
+            if sharpness >= 35.0:
+                sharp_frames += 1
+
+            encodings = face_recognition.face_encodings(
+                rgb, known_face_locations=locations
+            )
+            if encodings:
+                last_encoding = encodings[0]
+
+            # HOG + EAR blink heuristic. A blink is counted on the
+            # closed -> open transition to avoid counting every closed frame.
+            if ear < 0.21:
+                eye_closed = True
+            elif eye_closed:
+                blink_count += 1
+                eye_closed = False
+                log("LIVENESS", f"Blink detected ({blink_count}/2).")
+
+            remaining = max(0, int(deadline - time.monotonic()))
+            cv2.putText(
+                frame,
+                f"Blink twice | {blink_count}/2 | {remaining}s",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 255, 0),
+                2,
+            )
+            cv2.imshow("Kryvex Liveness — press Q to cancel", frame)
+
+            if blink_count >= 2 and last_encoding is not None and sharp_frames >= 3:
+                log_success("Liveness challenge passed.")
+                return last_encoding, nonce
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                exit_with_error("Liveness challenge cancelled.")
+
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+
+    exit_with_error(
+        "Liveness challenge timed out. "
+        "Make sure your face is visible and blink twice clearly."
+    )
+    raise AssertionError("unreachable")
+
+
+# ---------------------------------------------------------------------------
+# SerpApi / Google Lens
+# ---------------------------------------------------------------------------
+
+def upload_image_to_serpapi(image_path: str, api_key: str) -> str:
+    log("SERPAPI", "Uploading image to SerpApi Image API…")
+
+    path = Path(image_path)
+    # SerpApi's Image API currently supports JPG/JPEG, PNG and WebP
+    # and documents a 500 KB maximum.
+    if path.stat().st_size > 500_000:
+        exit_with_error(
+            f"Input image is {path.stat().st_size} bytes. "
+            "SerpApi Image API currently has a 500 KB upload limit. "
+            "Resize/compress the image first."
+        )
+
+    try:
+        with path.open("rb") as fh:
+            response = requests.post(
+                "https://serpapi.com/image",
+                files={"image": (path.name, fh, "application/octet-stream")},
+                data={"api_key": api_key},
+                timeout=60,
+            )
+    except requests.RequestException as exc:
+        exit_with_error(f"SerpApi image upload failed: {exc}")
+
+    if not response.ok:
+        exit_with_error(
+            f"SerpApi image upload failed: HTTP {response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        exit_with_error("SerpApi image upload returned invalid JSON.")
+
+    if payload.get("error"):
+        exit_with_error(f"SerpApi image upload error: {payload['error']}")
+
     image_id = payload.get("image_id")
     if not image_id:
-        exit_with_error(f"SerpApi did not return an image_id: {payload}")
+        exit_with_error("SerpApi upload succeeded but no image_id was returned.")
 
     log_success(f"Image uploaded — image_id: {image_id[:24]}…")
-    return image_id
+    return str(image_id)
 
 
 def run_google_lens_search(image_id: str, api_key: str) -> dict[str, Any]:
@@ -272,474 +354,542 @@ def run_google_lens_search(image_id: str, api_key: str) -> dict[str, Any]:
     params = {
         "engine": "google_lens",
         "image_id": image_id,
-        "api_key": api_key,
-        "hl": "en",
         "type": "all",
+        "api_key": api_key,
+        "no_cache": "true",
     }
 
     try:
-        results = GoogleSearch(params).get_dict()
-    except Exception as exc:
-        exit_with_error(f"SerpApi Google Lens request failed: {exc}")
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params=params,
+            timeout=90,
+        )
+    except requests.RequestException as exc:
+        exit_with_error(f"Google Lens request failed: {exc}")
 
-    if "error" in results:
-        exit_with_error(f"SerpApi returned an error: {results['error']}")
+    if not response.ok:
+        exit_with_error(
+            f"Google Lens request failed: HTTP {response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        exit_with_error("Google Lens returned invalid JSON.")
+
+    if payload.get("error"):
+        exit_with_error(f"Google Lens error: {payload['error']}")
 
     log_success("Google Lens search completed.")
-    return results
+    return payload
 
 
 def _is_social_media_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = parsed.netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return any(host == domain or host.endswith(f".{domain}") for domain in SOCIAL_MEDIA_DOMAINS)
-    except Exception:
-        return False
+    lowered = url.lower()
+    return any(domain in lowered for domain in SOCIAL_DOMAINS)
 
 
-def _collect_links(obj: Any, found: list[dict[str, str]]) -> None:
-    """Recursively harvest link/title/source tuples from SerpApi JSON."""
+def _image_candidate_urls(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.startswith(("http://", "https://")) else []
+
+    if isinstance(value, dict):
+        urls: list[str] = []
+        for key in (
+            "link",
+            "url",
+            "image",
+            "thumbnail",
+            "original",
+            "original_image",
+            "image_url",
+            "thumbnail_url",
+        ):
+            if key in value:
+                urls.extend(_image_candidate_urls(value[key]))
+        return urls
+
+    if isinstance(value, list):
+        urls: list[str] = []
+        for item in value:
+            urls.extend(_image_candidate_urls(item))
+        return urls
+
+    return []
+
+
+def _result_image_candidates(result: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+
+    for key in (
+        "image",
+        "thumbnail",
+        "original",
+        "original_image",
+        "image_url",
+        "thumbnail_url",
+    ):
+        if key in result:
+            urls.extend(_image_candidate_urls(result[key]))
+
+    # Some Lens response objects nest image data.
+    for key in ("images", "image_sources", "source", "visual_matches"):
+        if key in result:
+            urls.extend(_image_candidate_urls(result[key]))
+
+    return list(dict.fromkeys(urls))
+
+
+def _collect_social_results(
+    obj: Any,
+    found: list[dict[str, Any]],
+) -> None:
     if isinstance(obj, dict):
         link = obj.get("link")
-        if isinstance(link, str) and link.startswith("http"):
-            raw_image = obj.get("image") or obj.get("thumbnail") or ""
-            if isinstance(raw_image, dict):
-                raw_image = raw_image.get("link") or raw_image.get("url") or ""
-            found.append(
-                {
-                    "link": link,
-                    "title": str(obj.get("title", "")),
-                    "source": str(obj.get("source", "")),
-                    "image": str(raw_image) if raw_image else "",
-                }
-            )
+        if isinstance(link, str) and link.startswith(("http://", "https://")):
+            if _is_social_media_url(link):
+                found.append(
+                    {
+                        "link": link,
+                        "title": str(obj.get("title") or ""),
+                        "source": str(obj.get("source") or ""),
+                        "image_urls": _result_image_candidates(obj),
+                    }
+                )
+
         for value in obj.values():
-            _collect_links(value, found)
+            _collect_social_results(value, found)
+
     elif isinstance(obj, list):
         for item in obj:
-            _collect_links(item, found)
+            _collect_social_results(item, found)
 
 
-def find_social_media_match(results: dict[str, Any]) -> dict[str, str]:
+def find_social_media_matches(
+    results: dict[str, Any],
+) -> list[dict[str, Any]]:
     log("SERPAPI", "Scanning results for social-media matches…")
 
-    candidates: list[dict[str, str]] = []
-    _collect_links(results, candidates)
+    candidates: list[dict[str, Any]] = []
+    _collect_social_results(results, candidates)
 
-    # De-duplicate while preserving order
     seen: set[str] = set()
-    unique: list[dict[str, str]] = []
+    unique: list[dict[str, Any]] = []
+
     for item in candidates:
         link = item["link"]
-        if link not in seen:
-            seen.add(link)
-            unique.append(item)
+        if link in seen:
+            continue
+        seen.add(link)
+        unique.append(item)
 
-    social_matches = [item for item in unique if _is_social_media_url(item["link"])]
+    with_photo = [item for item in unique if item.get("image_urls")]
+    without_photo = [item for item in unique if not item.get("image_urls")]
+    ordered = with_photo + without_photo
 
-    if not social_matches:
-        log("SERPAPI", f"Total links found: {len(unique)} (none on social media).")
-        if unique:
-            log("SERPAPI", "Sample non-social links:")
-            for sample in unique[:5]:
-                print(f"    - {sample['link']}")
+    if not ordered:
         exit_with_error(
             "No social-media match found via reverse image search. "
             "Try a photo that appears on a public social profile."
         )
 
-    with_photo = [item for item in social_matches if item.get("image")]
-    match = with_photo[0] if with_photo else social_matches[0]
-    log_success(f"Social-media match: {match['link']}")
-    if match.get("title"):
-        print(f"    Title : {match['title']}")
-    if match.get("source"):
-        print(f"    Source: {match['source']}")
-    if len(social_matches) > 1:
-        print(f"    ({len(social_matches)} social matches found — using the first.)")
-
-    return match
+    log_success(f"{len(ordered)} social-media candidates found.")
+    return ordered
 
 
-def download_match_face(image_url: str) -> np.ndarray:
-    log("MATCH", f"Downloading Lens match image for biometric compare…")
-    if not image_url:
-        exit_with_error(
-            "Social match has no thumbnail/image URL. Cannot compare faces. "
-            "Try another photo or run with --dump-results to inspect SerpApi JSON."
-        )
+def download_match_face(image_urls: list[str]) -> np.ndarray:
+    if not image_urls:
+        raise ValueError("No image candidates attached to this social result.")
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (FaceID-Verification/1.0)",
-        "Accept": "image/*,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/139 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     }
-    try:
-        response = requests.get(image_url, headers=headers, timeout=30, stream=True)
-    except Exception as exc:
-        exit_with_error(f"Failed to download match image: {exc}")
 
-    if response.status_code != 200:
-        exit_with_error(
-            f"Match image download failed ({response.status_code}): {image_url}"
+    for index, image_url in enumerate(image_urls, start=1):
+        label = f"candidate {index}/{len(image_urls)}"
+
+        try:
+            response = requests.get(
+                image_url,
+                headers=headers,
+                timeout=30,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            log("MATCH", f"Skipping {label}: request failed ({exc.__class__.__name__}).")
+            continue
+
+        if not 200 <= response.status_code < 300:
+            log("MATCH", f"Skipping {label}: HTTP {response.status_code}.")
+            continue
+
+        content = response.content
+
+        if len(content) > DOWNLOAD_MAX_BYTES:
+            log("MATCH", f"Skipping {label}: image exceeds size limit.")
+            continue
+
+        content_type = (
+            response.headers.get("Content-Type", "")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
         )
 
-    chunks: list[bytes] = []
-    total = 0
-    for chunk in response.iter_content(chunk_size=65536):
-        total += len(chunk)
-        if total > DOWNLOAD_MAX_BYTES:
-            exit_with_error("Match image exceeded size limit.")
-        chunks.append(chunk)
+        # Reject obvious HTML/login/challenge responses. Some CDNs return
+        # application/octet-stream for actual images, so decoding is the
+        # final authority rather than Content-Type alone.
+        if content_type.startswith("text/") or "html" in content_type:
+            log(
+                "MATCH",
+                f"Skipping {label}: non-image Content-Type "
+                f"({content_type or 'missing'}).",
+            )
+            continue
 
-    encoded = np.frombuffer(b"".join(chunks), dtype=np.uint8)
-    bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-    if bgr is None:
-        exit_with_error("Match image could not be decoded as a picture.")
+        try:
+            with Image.open(BytesIO(content)) as image:
+                image = image.convert("RGB")
+                image_rgb = np.asarray(image)
+        except (UnidentifiedImageError, OSError, ValueError):
+            log("MATCH", f"Skipping {label}: image bytes could not be decoded.")
+            continue
 
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    encoding, count = encode_largest_face(rgb)
-    if count == 0 or encoding.size == 0:
-        exit_with_error("No face found in the reverse-search match image.")
-    log_success("Match image face encoded.")
-    return encoding
+        locations = _detect_faces_static(image_rgb)
 
+        if len(locations) != 1:
+            log(
+                "MATCH",
+                f"Skipping {label}: expected exactly one face, found "
+                f"{len(locations)}.",
+            )
+            continue
 
-# ---------------------------------------------------------------------------
-# Step 2b — Webcam liveness (blink + session nonce)
-# ---------------------------------------------------------------------------
-
-
-def _eye_aspect_ratio(eye_points: list) -> float:
-    pts = np.array(eye_points, dtype=np.float64)
-    if pts.shape[0] < 6:
-        return 0.0
-    vertical = np.linalg.norm(pts[1] - pts[5]) + np.linalg.norm(pts[2] - pts[4])
-    horizontal = np.linalg.norm(pts[0] - pts[3])
-    if horizontal == 0:
-        return 0.0
-    return float(vertical / (2.0 * horizontal))
-
-
-def _face_sharpness(image_rgb: np.ndarray, location: tuple[int, int, int, int]) -> float:
-    top, right, bottom, left = location
-    crop = image_rgb[max(top, 0) : bottom, max(left, 0) : right]
-    if crop.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def run_liveness_challenge(camera_index: int) -> tuple[np.ndarray, str]:
-    """Require a live blink in front of the webcam. Returns (live_encoding, nonce)."""
-    nonce = secrets.token_hex(4).upper()
-    log("LIVENESS", "Starting webcam challenge — blink twice while looking at the camera.")
-    print(f"    Challenge nonce: {nonce}")
-    print(f"    Window timeout : {LIVENESS_TIMEOUT_SEC}s  |  Press Q to abort")
-
-    if sys.platform.startswith("win"):
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    else:
-        cap = cv2.VideoCapture(camera_index)
-
-    if not cap.isOpened():
-        exit_with_error(
-            f"Cannot open webcam (index {camera_index}). "
-            "Plug in a camera or pass --skip-liveness only for debugging."
+        encodings = face_recognition.face_encodings(
+            image_rgb,
+            known_face_locations=locations,
         )
 
-    blinks = 0
-    closed_frames = 0
-    eyes_were_open = False
-    live_encoding: np.ndarray | None = None
-    show_window = True
-    deadline = time.time() + LIVENESS_TIMEOUT_SEC
+        if not encodings:
+            log("MATCH", f"Skipping {label}: face encoding failed.")
+            continue
 
-    try:
-        while time.time() < deadline:
-            ok, frame_bgr = cap.read()
-            if not ok:
-                continue
+        log_success(f"Match image face encoded from {label}.")
+        return encodings[0]
 
-            frame_bgr = cv2.flip(frame_bgr, 1)
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            locations = face_recognition.face_locations(frame_rgb, model="hog")
-
-            remaining = max(0, int(deadline - time.time()))
-            status = f"Nonce {nonce} | Blink {blinks}/{BLINKS_REQUIRED} | {remaining}s"
-
-            if len(locations) > 1:
-                status = "Multiple faces — one person only"
-            elif not locations:
-                status = f"No face | Nonce {nonce} | {remaining}s"
-            else:
-                loc = locations[0]
-                landmarks_list = face_recognition.face_landmarks(
-                    frame_rgb, face_locations=[loc]
-                )
-                sharpness = _face_sharpness(frame_rgb, loc)
-                top, right, bottom, left = loc
-                cv2.rectangle(frame_bgr, (left, top), (right, bottom), (0, 220, 0), 2)
-
-                if sharpness < MIN_FACE_SHARPNESS:
-                    status = f"Hold still / move closer (blur or screen?) | {remaining}s"
-                elif landmarks_list:
-                    lm = landmarks_list[0]
-                    left_ear = _eye_aspect_ratio(lm.get("left_eye", []))
-                    right_ear = _eye_aspect_ratio(lm.get("right_eye", []))
-                    ear = (left_ear + right_ear) / 2.0
-
-                    if ear < EAR_BLINK_THRESHOLD:
-                        closed_frames += 1
-                    else:
-                        if closed_frames >= BLINK_CONSEC_FRAMES and eyes_were_open:
-                            blinks += 1
-                            log("LIVENESS", f"Blink {blinks}/{BLINKS_REQUIRED} detected")
-                        closed_frames = 0
-                        eyes_were_open = True
-
-                    encodings = face_recognition.face_encodings(
-                        frame_rgb, known_face_locations=[loc]
-                    )
-                    if encodings:
-                        live_encoding = encodings[0]
-
-                    status = (
-                        f"Nonce {nonce} | Blink {blinks}/{BLINKS_REQUIRED} | "
-                        f"EAR {ear:.2f} | {remaining}s"
-                    )
-
-            cv2.putText(
-                frame_bgr,
-                status,
-                (16, 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame_bgr,
-                "Blink twice naturally. Printed photos will fail.",
-                (16, 62),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-            if show_window:
-                try:
-                    cv2.imshow("Liveness challenge", frame_bgr)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), ord("Q"), 27):
-                        exit_with_error("Liveness aborted by user.")
-                except cv2.error:
-                    show_window = False
-
-            if blinks >= BLINKS_REQUIRED and live_encoding is not None:
-                log_success("Liveness passed (blink challenge + live encoding).")
-                return live_encoding, nonce
-    finally:
-        cap.release()
-        if show_window:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
-
-    exit_with_error(
-        "Liveness failed: not enough blinks in time, or no usable live face. "
-        "Use a real camera (a printed photo will not blink)."
-    )
-    raise AssertionError("unreachable")
+    raise ValueError("All image candidates failed download/decode/face detection.")
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Blockchain (Polygon Amoy)
+# Solidity / Polygon
 # ---------------------------------------------------------------------------
 
-
-def compile_contract() -> tuple[list[dict], str]:
-    log("BLOCKCHAIN", f"Compiling VerificationLog.sol (solc {SOLC_VERSION})…")
+def compile_contract() -> tuple[list[dict[str, Any]], str]:
     if not CONTRACT_SOURCE.is_file():
-        exit_with_error(f"Contract source not found: {CONTRACT_SOURCE}")
-
-    install_solc(SOLC_VERSION)
-    set_solc_version(SOLC_VERSION)
+        exit_with_error(
+            f"Contract source not found: {CONTRACT_SOURCE}. "
+            "Keep VerificationLog.sol beside pipeline.py."
+        )
 
     source = CONTRACT_SOURCE.read_text(encoding="utf-8")
-    compiled = compile_standard(
-        {
-            "language": "Solidity",
-            "sources": {"VerificationLog.sol": {"content": source}},
-            "settings": {
-                "outputSelection": {
-                    "*": {"*": ["abi", "evm.bytecode"]},
-                }
-            },
-        },
-        solc_version=SOLC_VERSION,
-    )
 
-    contract_data = compiled["contracts"]["VerificationLog.sol"]["VerificationLog"]
+    try:
+        install_solc(SOLIDITY_VERSION)
+        set_solc_version(SOLIDITY_VERSION)
+
+        compiled = compile_standard(
+            {
+                "language": "Solidity",
+                "sources": {
+                    CONTRACT_SOURCE.name: {"content": source}
+                },
+                "settings": {
+    "optimizer": {
+        "enabled": True,
+        "runs": 200,
+    },
+    "outputSelection": {
+        "*": {
+            "*": ["abi", "evm.bytecode.object"]
+        }
+    }
+},
+            },
+            solc_version=SOLIDITY_VERSION,
+        )
+    except Exception as exc:
+        exit_with_error(f"Solidity compilation failed: {exc}")
+
+    contract_data = compiled["contracts"][CONTRACT_SOURCE.name]["VerificationLog"]
     abi = contract_data["abi"]
     bytecode = contract_data["evm"]["bytecode"]["object"]
+
+    if not bytecode:
+        exit_with_error("Compiled contract contains no bytecode.")
+
     log_success("Contract compiled.")
     return abi, bytecode
 
 
+def _signed_raw_transaction(signed: Any) -> bytes:
+    raw = getattr(signed, "raw_transaction", None)
+    if raw is None:
+        raw = getattr(signed, "rawTransaction", None)
+    if raw is None:
+        raise RuntimeError("web3.py signed transaction has no raw transaction bytes.")
+    return raw
+
+
+def _build_gas_fields(w3: Web3) -> dict[str, int]:
+    gas_price = int(w3.eth.gas_price)
+
+    # Polygon Amoy currently requires at least a 25 gwei priority fee.
+    min_priority_fee = 25_000_000_000
+    max_priority_fee = 30_000_000_000
+
+    priority = min(
+        max_priority_fee,
+        max(min_priority_fee, gas_price // 10),
+    )
+
+    max_fee = max(
+        gas_price * 2,
+        priority * 2,
+    )
+
+    return {
+        "maxPriorityFeePerGas": priority,
+        "maxFeePerGas": max_fee,
+    }
+
+
 def connect_web3(rpc_url: str) -> Web3:
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 60}))
-    # Polygon PoS sidechain uses extraData field differently
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
     if not w3.is_connected():
-        exit_with_error(f"Cannot connect to Polygon RPC: {rpc_url}")
+        exit_with_error("Could not connect to Polygon RPC.")
 
-    chain_id = w3.eth.chain_id
-    if chain_id != AMOY_CHAIN_ID:
+    chain_id = int(w3.eth.chain_id)
+    log_success(f"RPC connected — chain ID: {chain_id}")
+
+    if chain_id != 80002:
         exit_with_error(
-            f"Connected chain ID {chain_id} != expected Amoy testnet ({AMOY_CHAIN_ID}). "
-            "Check POLYGON_RPC_URL."
+            f"Expected Polygon Amoy chain ID 80002, but RPC returned {chain_id}."
         )
 
     return w3
 
 
-def get_contract(w3: Web3, config: dict[str, str], abi: list[dict], bytecode: str):
-    account = w3.eth.account.from_key(config["WALLET_PRIVATE_KEY"])
-    log("BLOCKCHAIN", f"Wallet address: {account.address}")
-
-    balance_wei = w3.eth.get_balance(account.address)
-    balance_matic = w3.from_wei(balance_wei, "ether")
-    log("BLOCKCHAIN", f"Wallet balance: {balance_matic:.6f} MATIC")
-
-    if balance_wei == 0:
+def get_contract(
+    w3: Web3,
+    config: dict[str, str],
+    abi: list[dict[str, Any]],
+    bytecode: str,
+) -> tuple[Any, Any]:
+    try:
+        account = w3.eth.account.from_key(config["WALLET_PRIVATE_KEY"])
+    except Exception as exc:
         exit_with_error(
-            "Wallet has 0 MATIC. Fund it via the Polygon Amoy faucet: "
-            "https://faucet.polygon.technology/"
+            "WALLET_PRIVATE_KEY is not a valid 64-hex-character private key."
+        )
+
+    balance = w3.eth.get_balance(account.address)
+    log("BLOCKCHAIN", f"Wallet: {account.address}")
+    log(
+        "BLOCKCHAIN",
+        f"Balance: {w3.from_wei(balance, 'ether')} POL",
+    )
+
+    if balance == 0:
+        exit_with_error(
+            "Wallet has 0 POL on Polygon Amoy. Fund it with testnet POL before "
+            "deploying/submitting transactions."
         )
 
     contract_address = config.get("CONTRACT_ADDRESS", "")
+
     if contract_address:
-        log("BLOCKCHAIN", f"Using existing contract: {contract_address}")
         if not w3.is_address(contract_address):
             exit_with_error(f"Invalid CONTRACT_ADDRESS: {contract_address}")
+
         contract = w3.eth.contract(
-            address=Web3.to_checksum_address(contract_address), abi=abi
+            address=Web3.to_checksum_address(contract_address),
+            abi=abi,
         )
-    else:
-        log("BLOCKCHAIN", "Deploying VerificationLog contract to Amoy…")
-        Contract = w3.eth.contract(abi=abi, bytecode=bytecode)
-        nonce = w3.eth.get_transaction_count(account.address)
+        log_success(f"Using existing contract: {contract_address}")
+        return contract, account
 
-        deploy_tx = Contract.constructor().build_transaction(
-            {
-                "from": account.address,
-                "nonce": nonce,
-                "chainId": AMOY_CHAIN_ID,
-                "gas": 2_000_000,
-                "maxFeePerGas": w3.to_wei(50, "gwei"),
-                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
-            }
+    log("BLOCKCHAIN", "Deploying VerificationLog contract to Amoy…")
+
+    Contract = w3.eth.contract(abi=abi, bytecode=bytecode)
+    nonce = w3.eth.get_transaction_count(account.address)
+
+    tx = Contract.constructor().build_transaction(
+    {
+        "from": account.address,
+        "nonce": nonce,
+        "chainId": 80002,
+        "gas": 1_000_000,
+        **_build_gas_fields(w3),
+    }
+)
+
+    try:
+       # Polygon Amoy can occasionally fail gas estimation for contract
+       # creation even when the deployment itself is valid.
+       # VerificationLog is a small contract, so use an explicit safe limit.
+       tx["gas"] = 1_000_000
+
+       signed = account.sign_transaction(tx)
+       tx_hash = w3.eth.send_raw_transaction(_signed_raw_transaction(signed))
+       log("BLOCKCHAIN", f"Deploy tx sent: {tx_hash.hex()}")
+
+       receipt = w3.eth.wait_for_transaction_receipt(
+            tx_hash,
+            timeout=180,
+        )
+    except Exception as exc:
+        exit_with_error(f"Contract deployment failed: {exc}")
+
+    if receipt["status"] != 1 or not receipt.get("contractAddress"):
+        exit_with_error(
+            f"Contract deployment failed. Tx: {tx_hash.hex()}"
         )
 
-        signed = account.sign_transaction(deploy_tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        log("BLOCKCHAIN", f"Deploy tx sent: {tx_hash.hex()}")
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    contract_address = receipt["contractAddress"]
+    log_success(f"Contract deployed at: {contract_address}")
 
-        if receipt["status"] != 1:
-            exit_with_error(f"Contract deployment failed. Tx: {tx_hash.hex()}")
+    print(
+        f"    PolygonScan: "
+        f"https://amoy.polygonscan.com/address/{contract_address}"
+    )
 
-        contract_address = receipt["contractAddress"]
-        log_success(f"Contract deployed at: {contract_address}")
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(contract_address), abi=abi
-        )
-
-    return contract, account
+    return (
+        w3.eth.contract(
+            address=Web3.to_checksum_address(contract_address),
+            abi=abi,
+        ),
+        account,
+    )
 
 
 def submit_record(
     w3: Web3,
-    contract,
-    account,
+    contract: Any,
+    account: Any,
     face_hash: str,
     matched_url: str,
     timestamp: int,
     challenge_nonce: str,
 ) -> str:
-    log("BLOCKCHAIN", "Submitting verification record on-chain…")
-    print(f"    faceHash   : {face_hash}")
-    print(f"    matchedUrl : {matched_url}")
-    print(f"    timestamp  : {timestamp}")
-    print(f"    nonce      : {challenge_nonce}")
+    log("BLOCKCHAIN", "Writing verification record to Polygon Amoy…")
 
     nonce = w3.eth.get_transaction_count(account.address)
+
     tx = contract.functions.addRecord(
-        face_hash, matched_url, timestamp, challenge_nonce
+        face_hash,
+        matched_url,
+        timestamp,
+        challenge_nonce,
     ).build_transaction(
         {
             "from": account.address,
             "nonce": nonce,
-            "chainId": AMOY_CHAIN_ID,
-            "gas": 500_000,
-            "maxFeePerGas": w3.to_wei(50, "gwei"),
-            "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+            "chainId": 80002,
+            **_build_gas_fields(w3),
         }
     )
 
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    log("BLOCKCHAIN", f"Transaction sent: {tx_hash.hex()}")
-    log("BLOCKCHAIN", "Waiting for confirmation…")
+    try:
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(_signed_raw_transaction(signed))
+        log("BLOCKCHAIN", f"Transaction sent: {tx_hash.hex()}")
 
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        receipt = w3.eth.wait_for_transaction_receipt(
+            tx_hash,
+            timeout=180,
+        )
+    except Exception as exc:
+        exit_with_error(f"Blockchain transaction failed: {exc}")
+
     if receipt["status"] != 1:
         exit_with_error(f"Transaction reverted. Tx: {tx_hash.hex()}")
 
-    log_success(f"Confirmed in block {receipt['blockNumber']}")
+    log_success(f"Verification record confirmed in block {receipt['blockNumber']}.")
+    print(f"    Transaction: https://amoy.polygonscan.com/tx/{tx_hash.hex()}")
+
     return tx_hash.hex()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def verify_record_on_chain(
+    contract: Any,
+    face_hash: str,
+    matched_url: str,
+    timestamp: int,
+) -> bool:
+    """Read the just-written record back and compare its fingerprint fields."""
+    try:
+        count = int(contract.functions.recordCount().call())
+        if count <= 0:
+            return False
 
+        record = contract.functions.getRecord(count - 1).call()
+
+        # Expected struct order from VerificationLog.sol:
+        # faceHash, matchedUrl, timestamp, nonce
+        chain_face_hash = str(record[0])
+        chain_url = str(record[1])
+        chain_timestamp = int(record[2])
+
+        return (
+            chain_face_hash == face_hash
+            and chain_url == matched_url
+            and chain_timestamp == timestamp
+        )
+    except Exception as exc:
+        log("BLOCKCHAIN", f"On-chain readback failed: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Face ID + Blockchain Verification Pipeline"
+        description=APP_TITLE,
     )
+
     parser.add_argument(
         "image",
-        type=Path,
-        help="Path to the input image containing a face",
+        help="Path to the input image containing one face",
     )
+
     parser.add_argument(
         "--dump-results",
         action="store_true",
-        help="Save raw SerpApi JSON to serpapi_results.json (debug)",
+        help="Save raw SerpApi JSON to serpapi_results.json",
     )
+
     parser.add_argument(
         "--skip-liveness",
         action="store_true",
-        help="Skip webcam blink challenge (debug only — photo spoofing will succeed)",
+        help="Skip webcam liveness challenge (debug only)",
     )
+
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
-        help="Webcam device index (default 0)",
+        help="Webcam device index (default: 0)",
     )
+
     return parser.parse_args()
 
 
@@ -748,66 +898,190 @@ def main() -> None:
     config = load_config()
 
     print("=" * 60)
-    print("  Face ID + Blockchain Verification Pipeline")
+    print(f"  {APP_TITLE}")
     print("=" * 60)
     print()
 
-    # --- Step 1: Face on the input photo (used for reverse search) ---
+    # Step 1 — uploaded face
     image_rgb = load_image_rgb(args.image)
     uploaded_encoding, uploaded_hash = detect_and_hash_face(image_rgb)
     print()
 
-    # --- Step 1b: Live person must blink in front of the camera ---
+    # Step 1b — liveness
     if args.skip_liveness:
-        log("LIVENESS", "SKIPPED — photo-to-camera spoofing is not blocked.")
+        log(
+            "LIVENESS",
+            "SKIPPED — photo-to-camera spoofing is not blocked.",
+        )
         live_encoding = uploaded_encoding
         challenge_nonce = "SKIPPED"
     else:
         live_encoding, challenge_nonce = run_liveness_challenge(args.camera)
-        encodings_match(uploaded_encoding, live_encoding, "live webcam vs uploaded photo")
+
+        distance = encodings_match(
+            uploaded_encoding,
+            live_encoding,
+            "live webcam vs uploaded photo",
+        )
+
+        if distance > FACE_DISTANCE_THRESHOLD:
+            exit_with_error(
+                f"Live person does not match uploaded photo. "
+                f"Distance {distance:.4f} > {FACE_DISTANCE_THRESHOLD:.2f}."
+            )
+
+        log_success("Live webcam matches uploaded face.")
+
     print()
 
-    # --- Step 2: Reverse image search on the uploaded file ---
-    image_id = upload_image_to_serpapi(args.image, config["SERPAPI_KEY"])
-    lens_results = run_google_lens_search(image_id, config["SERPAPI_KEY"])
+    # Step 2 — genuine web/social-media discovery
+    image_id = upload_image_to_serpapi(
+        args.image,
+        config["SERPAPI_KEY"],
+    )
+
+    lens_results = run_google_lens_search(
+        image_id,
+        config["SERPAPI_KEY"],
+    )
 
     if args.dump_results:
         dump_path = Path("serpapi_results.json")
-        dump_path.write_text(json.dumps(lens_results, indent=2), encoding="utf-8")
+        dump_path.write_text(
+            json.dumps(lens_results, indent=2),
+            encoding="utf-8",
+        )
         log("SERPAPI", f"Raw results saved to {dump_path}")
 
-    match = find_social_media_match(lens_results)
-    matched_url = match["link"]
-    match_encoding = download_match_face(match.get("image", ""))
-    encodings_match(live_encoding, match_encoding, "live webcam vs Google Lens match photo")
-    timestamp = int(time.time())
-    print()
+    matches = find_social_media_matches(lens_results)
 
-    # Commit the *live* face, not the file on disk.
+    print()
+    log("MATCH", f"Testing up to {len(matches)} social-media results...")
+
+    matched_url: str | None = None
+    matched_distance: float | None = None
+
+    best_url: str | None = None
+    best_distance: float | None = None
+
+    for result_index, match in enumerate(matches, start=1):
+        print()
+        log(
+            "MATCH",
+            f"Testing social result {result_index}/{len(matches)}",
+        )
+        print(f"    URL   : {match['link']}")
+
+        if match.get("title"):
+            print(f"    Title : {match['title']}")
+
+        if match.get("source"):
+            print(f"    Source: {match['source']}")
+
+        try:
+            match_encoding = download_match_face(
+                match.get("image_urls", [])
+            )
+        except ValueError as exc:
+            log("MATCH", f"Skipping result: {exc}")
+            continue
+
+        distance = encodings_match(
+            live_encoding,
+            match_encoding,
+            "live webcam vs Google Lens match photo",
+        )
+
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_url = match["link"]
+            log(
+                "MATCH",
+                f"New best candidate — distance={distance:.4f}",
+            )
+
+        if distance <= FACE_DISTANCE_THRESHOLD:
+            log_success(
+                f"Candidate passes threshold — distance={distance:.4f}. "
+                "Continuing to verify remaining candidates."
+            )
+
+    if (
+        best_url is not None
+        and best_distance is not None
+        and best_distance <= FACE_DISTANCE_THRESHOLD
+    ):
+        matched_url = best_url
+        matched_distance = best_distance
+
+        log_success(
+            f"BEST BIOMETRIC MATCH — distance={matched_distance:.4f}."
+        )
+    else:
+        exit_with_error(
+            "No social-media result passed biometric verification. "
+            "All usable Lens candidates were tested."
+        )
+
+    print()
+    print(f"    Verified social URL : {matched_url}")
+    print(f"    Face distance       : {matched_distance:.4f}")
+
+    # Step 3 — blockchain
+    timestamp = int(time.time())
+
+    # Store the live face encoding hash, not the raw biometric image.
     face_hash = hash_encoding(live_encoding)
-    log("FACE", f"On-chain face hash is from the live capture: {face_hash}")
+
+    log("FACE", f"On-chain face hash: {face_hash}")
     print(f"    Uploaded-photo hash (audit only): {uploaded_hash}")
     print()
 
-    # --- Step 3: Blockchain ---
     abi, bytecode = compile_contract()
     w3 = connect_web3(config["POLYGON_RPC_URL"])
-    contract, account = get_contract(w3, config, abi, bytecode)
-    tx_hash = submit_record(
-        w3, contract, account, face_hash, matched_url, timestamp, challenge_nonce
+    contract, account = get_contract(
+        w3,
+        config,
+        abi,
+        bytecode,
     )
+
+    tx_hash = submit_record(
+        w3,
+        contract,
+        account,
+        face_hash,
+        matched_url,
+        timestamp,
+        challenge_nonce,
+    )
+
     print()
 
-    # --- Done ---
-    explorer_url = POLYGONSCAN_TX_URL.format(tx_hash=tx_hash)
+    # Demonstrate the required "re-verifying against the on-chain record".
+    log("VERIFY", "Reading the latest verification record from Polygon…")
+
+    verified = verify_record_on_chain(
+        contract,
+        face_hash,
+        matched_url,
+        timestamp,
+    )
+
+    if not verified:
+        exit_with_error(
+            "On-chain verification failed: the stored record did not "
+            "match the submitted fingerprint."
+        )
+
+    log_success("ON-CHAIN VERIFICATION PASSED.")
+    print()
     print("=" * 60)
-    print("  PIPELINE COMPLETE")
+    print("  END-TO-END VERIFICATION COMPLETE")
     print("=" * 60)
-    print(f"  Face hash     : {face_hash}")
-    print(f"  Matched URL   : {matched_url}")
-    print(f"  Challenge     : {challenge_nonce}")
-    print(f"  Timestamp     : {timestamp}")
-    print(f"  PolygonScan   : {explorer_url}")
+    print(f"  Social match : {matched_url}")
+    print(f"  Face hash    : {face_hash}")
+    print(f"  Tx hash      : {tx_hash}")
     print("=" * 60)
 
 
