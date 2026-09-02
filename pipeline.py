@@ -499,7 +499,9 @@ def find_social_media_matches(
     return ordered
 
 
-def download_match_face(image_urls: list[str]) -> np.ndarray:
+def download_match_face(
+    image_urls: list[str],
+) -> tuple[np.ndarray, bytes]:
     if not image_urls:
         raise ValueError("No image candidates attached to this social result.")
 
@@ -581,7 +583,7 @@ def download_match_face(image_urls: list[str]) -> np.ndarray:
             continue
 
         log_success(f"Match image face encoded from {label}.")
-        return encodings[0]
+        return encodings[0], content
 
     raise ValueError("All image candidates failed download/decode/face detection.")
 
@@ -785,6 +787,7 @@ def submit_record(
     account: Any,
     face_hash: str,
     matched_url: str,
+    post_hash: str,
     timestamp: int,
     challenge_nonce: str,
 ) -> str:
@@ -795,6 +798,7 @@ def submit_record(
     tx = contract.functions.addRecord(
         face_hash,
         matched_url,
+        post_hash,
         timestamp,
         challenge_nonce,
     ).build_transaction(
@@ -831,9 +835,10 @@ def verify_record_on_chain(
     contract: Any,
     face_hash: str,
     matched_url: str,
+    post_hash: str,
     timestamp: int,
 ) -> bool:
-    """Read the just-written record back and compare its fingerprint fields."""
+    """Read the latest record and verify all fingerprint fields."""
     try:
         count = int(contract.functions.recordCount().call())
         if count <= 0:
@@ -842,15 +847,27 @@ def verify_record_on_chain(
         record = contract.functions.getRecord(count - 1).call()
 
         # Expected struct order from VerificationLog.sol:
-        # faceHash, matchedUrl, timestamp, nonce
+        # faceHash, matchedUrl, postHash, timestamp, nonce
         chain_face_hash = str(record[0])
         chain_url = str(record[1])
-        chain_timestamp = int(record[2])
+        chain_post_hash = str(record[2])
+        chain_timestamp = int(record[3])
+
+        face_verified = chain_face_hash == face_hash
+        url_verified = chain_url == matched_url
+        post_verified = chain_post_hash == post_hash
+        timestamp_verified = chain_timestamp == timestamp
+
+        log("VERIFY", f"Face hash: {'✓' if face_verified else '✗'}")
+        log("VERIFY", f"Social URL: {'✓' if url_verified else '✗'}")
+        log("VERIFY", f"Post fingerprint: {'✓' if post_verified else '✗'}")
+        log("VERIFY", f"Timestamp: {'✓' if timestamp_verified else '✗'}")
 
         return (
-            chain_face_hash == face_hash
-            and chain_url == matched_url
-            and chain_timestamp == timestamp
+            face_verified
+            and url_verified
+            and post_verified
+            and timestamp_verified
         )
     except Exception as exc:
         log("BLOCKCHAIN", f"On-chain readback failed: {exc}")
@@ -963,6 +980,7 @@ def main() -> None:
 
     best_url: str | None = None
     best_distance: float | None = None
+    best_image_bytes: bytes | None = None
 
     for result_index, match in enumerate(matches, start=1):
         print()
@@ -979,7 +997,7 @@ def main() -> None:
             print(f"    Source: {match['source']}")
 
         try:
-            match_encoding = download_match_face(
+            match_encoding, match_image_bytes = download_match_face(
                 match.get("image_urls", [])
             )
         except ValueError as exc:
@@ -995,6 +1013,7 @@ def main() -> None:
         if best_distance is None or distance < best_distance:
             best_distance = distance
             best_url = match["link"]
+            best_image_bytes = match_image_bytes
             log(
                 "MATCH",
                 f"New best candidate — distance={distance:.4f}",
@@ -1033,6 +1052,16 @@ def main() -> None:
     # Store the live face encoding hash, not the raw biometric image.
     face_hash = hash_encoding(live_encoding)
 
+    if best_image_bytes is None or matched_url is None:
+        exit_with_error("Cannot fingerprint the verified social post.")
+
+    # Fingerprint the verified social evidence using the matched URL
+    # together with the exact downloaded image bytes that were face-matched.
+    post_hash = hashlib.sha256(
+        matched_url.encode("utf-8") + best_image_bytes
+    ).hexdigest()
+
+    log("POST", f"Post fingerprint (SHA-256): {post_hash}")
     log("FACE", f"On-chain face hash: {face_hash}")
     print(f"    Uploaded-photo hash (audit only): {uploaded_hash}")
     print()
@@ -1052,6 +1081,7 @@ def main() -> None:
         account,
         face_hash,
         matched_url,
+        post_hash,
         timestamp,
         challenge_nonce,
     )
@@ -1065,15 +1095,17 @@ def main() -> None:
         contract,
         face_hash,
         matched_url,
+        post_hash,
         timestamp,
     )
 
     if not verified:
         exit_with_error(
             "On-chain verification failed: the stored record did not "
-            "match the submitted fingerprint."
+            "match the submitted fingerprints."
         )
 
+    log_success("POST FINGERPRINT VERIFIED.")
     log_success("ON-CHAIN VERIFICATION PASSED.")
     print()
     print("=" * 60)
@@ -1081,6 +1113,7 @@ def main() -> None:
     print("=" * 60)
     print(f"  Social match : {matched_url}")
     print(f"  Face hash    : {face_hash}")
+    print(f"  Post hash    : {post_hash}")
     print(f"  Tx hash      : {tx_hash}")
     print("=" * 60)
 
