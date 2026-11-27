@@ -332,9 +332,10 @@ def run_liveness_challenge(camera_index: int) -> tuple[np.ndarray, bytes, str]:
             if ear < 0.21:
                 eye_closed = True
             elif eye_closed:
-                blink_count += 1
+                if blink_count < 2:
+                    blink_count += 1
+                    log("LIVENESS", f"Blink detected ({blink_count}/2).")
                 eye_closed = False
-                log("LIVENESS", f"Blink detected ({blink_count}/2).")
 
             remaining = max(0, int(deadline - time.monotonic()))
             cv2.putText(
@@ -1337,10 +1338,23 @@ def main() -> None:
         best_is_near_duplicate,
     ) = selected
 
-    second_best_similarity = (
-        face_ranked[1][0]
-        if len(face_ranked) > 1
-        else None
+    # Ambiguity is measured between distinct social URLs (profiles/posts),
+    # not multiple image variants returned for the same URL.
+    best_score_by_url: dict[str, float] = {}
+    for candidate in candidate_scores:
+        score, url = candidate[0], candidate[1]
+        best_score_by_url[url] = max(
+            best_score_by_url.get(url, float("-inf")),
+            score,
+        )
+
+    second_best_similarity = max(
+        (
+            score
+            for url, score in best_score_by_url.items()
+            if url != best_url
+        ),
+        default=None,
     )
     face_margin = (
         best_combined - second_best_similarity
